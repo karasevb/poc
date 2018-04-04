@@ -241,7 +241,7 @@ pmixp_coll_ring_t *coll_ring_get() {
 static void _reset_coll_ring(pmixp_coll_ring_t *coll) {
 	ring_cbfunc_t cbfunc;
 	//LOG("seq %d", coll->seq);
-	coll->ctx->state = PMIXP_COLL_RING_SYNC;
+	coll->ctx->state = PMIXP_COLL_RING_NONE;
 	coll->ctx->contrib_local = false;
 	coll->ctx->contrib_prev = 0;
 	coll->ctx->contrib_next = 0;
@@ -294,7 +294,12 @@ static void _progress_ring(pmixp_coll_ring_t *coll) {
 				//}
 				/* */
 				_reset_coll_ring(coll);
+				/* disable the old coll */
+				coll->ctx->state = PMIXP_COLL_RING_NONE;
+				/* shift to new coll */
 				_coll_ctx_shift(coll);
+				coll->ctx->state = PMIXP_COLL_RING_SYNC;
+				/* send the all collected ring contribs for the new collective */
 				_coll_send_all(coll);
 				break;
 		}
