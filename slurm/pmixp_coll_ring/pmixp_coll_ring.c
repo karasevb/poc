@@ -16,12 +16,16 @@ typedef enum {
 } pmixp_coll_ring_state_t;
 
 typedef struct {
+	uint32_t id;
 	bool contrib_local;
 	uint32_t contrib_prev;
 	uint32_t contrib_next;
 	pmixp_coll_ring_state_t state;
 	Buf ring_buf;
 	List send_list;
+	pthread_mutex_t lock;
+	void *cbfunc;
+	void *cbdata;
 } pmixp_coll_ring_ctx_t;
 
 typedef struct {
@@ -54,7 +58,7 @@ typedef struct {
 
 static int _rank, _size;
 
-pthread_t read_thread_id;
+pthread_t progress_thread[2];
 
 typedef void (*ring_cbfunc_t)(pmixp_coll_ring_t *coll);
 
@@ -76,8 +80,10 @@ static int _next_id(pmixp_coll_ring_t *coll) {
 }
 
 void _coll_ctx_shift(pmixp_coll_ring_t *coll) {
-	uint32_t idx = (coll->ctx_cur + 1) % _RING_CTX_NUM;
-	coll->ctx = &coll->ctx_array[idx];
+	LOG("shift coll ctx");
+	assert(coll->ctx);
+	coll->ctx_cur = (coll->ctx_cur + 1) % _RING_CTX_NUM;
+	coll->ctx = &coll->ctx_array[coll->ctx_cur];
 }
 
 static void _msg_send_nb(pmixp_coll_ring_t *coll, uint32_t sender, char *data, size_t size) {
@@ -99,6 +105,7 @@ static void _msg_send_nb(pmixp_coll_ring_t *coll, uint32_t sender, char *data, s
 
 static void _coll_send_all(pmixp_coll_ring_t *coll) {
 	ring_data_t *msg;
+	assert(coll->ctx);
 
 	//LOG("send count %d", list_count(coll->ctx->send_list));
 	while (!list_is_empty(coll->ctx->send_list)) {
@@ -113,14 +120,36 @@ static void _coll_send_all(pmixp_coll_ring_t *coll) {
 	}
 }
 
+void * _coll_progress_thread(void *args) {
+	pmixp_coll_ring_t *coll = (pmixp_coll_ring_t*)args;
+	_progress_ring(coll);
+	return NULL;
+}
+
+void _threadshift_progress(pmixp_coll_ring_t *coll) {
+	assert(coll->ctx_cur < _RING_CTX_NUM);
+	assert(coll->ctx);
+
+	int rc = pthread_create(&progress_thread[coll->ctx_cur], NULL, _coll_progress_thread, (void*)coll);
+	if (rc != 0) {
+	    printf("error: can't create progress thread, rc = %d\n", rc);
+	    abort();
+	}
+}
+
+
 int coll_ring_contrib_local(pmixp_coll_ring_t *coll, char *data, size_t size,
 			    void *cbfunc, void *cbdata) {
 	int ret = SLURM_SUCCESS;
 	ring_data_t *msg;
+	assert(coll->ctx);
+
+	slurm_mutex_lock(&coll->ctx->lock);
 
 	if (coll->ctx->contrib_local) {
 		/* Double contribution - reject */
 		ret = SLURM_ERROR;
+		slurm_mutex_unlock(&coll->ctx->lock);
 		goto exit;
 	}
 
@@ -152,7 +181,8 @@ int coll_ring_contrib_local(pmixp_coll_ring_t *coll, char *data, size_t size,
 	coll->cbfunc = cbfunc;
 	coll->cbdata = cbdata;
 
-	_progress_ring(coll);
+	slurm_mutex_unlock(&coll->ctx->lock);
+	_threadshift_progress(coll);
 exit:
 	return ret;
 }
@@ -164,19 +194,24 @@ int coll_ring_contrib_prev(pmixp_coll_ring_t *coll, msg_hdr_t *hdr, Buf buf) {
 	char *data_src = NULL, *data_dst = NULL;
 	bool coll_shifted = false;
 
+	assert(coll->ctx);
+
 	if (hdr->nodeid != _prev_id(coll)) {
 		LOG("unexpected peerid %d, expect %d", hdr->nodeid, _prev_id(coll));
 		goto exit;
 	}
 
+	if (hdr->ring_seq != coll->ctx->contrib_prev) {
+		LOG("error: unexpected msg seq number %d, expect %d", hdr->ring_seq, coll->ctx->contrib_prev);
+		goto exit;
+	}
+
+	slurm_mutex_lock(&coll->ctx->lock);
+
 	/* shift the coll context if that the next coll contrib */
 	if ((coll->seq +1) == hdr->seq) {
 		_coll_ctx_shift(coll);
 		coll_shifted = true;
-	}
-	if (hdr->ring_seq != coll->ctx->contrib_prev) {
-		LOG("error: unexpected msg seq number %d, expect %d", hdr->ring_seq, coll->ctx->contrib_prev);
-		goto exit;
 	}
 
 	/* save & mark contribution */
@@ -205,12 +240,18 @@ int coll_ring_contrib_prev(pmixp_coll_ring_t *coll, msg_hdr_t *hdr, Buf buf) {
 	}
 
 	coll->ctx->contrib_prev++;
+	slurm_mutex_unlock(&coll->ctx->lock);
 
-	_progress_ring(coll);
-exit:
+	/* ring coll progress */
+	_threadshift_progress(coll);
+
+	// TODO cond wait
 	if (coll_shifted) {
+		slurm_mutex_lock(&coll->ctx->lock);
 		_coll_ctx_shift(coll);
+		slurm_mutex_unlock(&coll->ctx->lock);
 	}
+exit:
 	return ret;
 }
 
@@ -222,16 +263,19 @@ pmixp_coll_ring_t *coll_ring_get() {
 
 	for (i = 0; i < _RING_CTX_NUM; i++) {
 		coll->ctx = &coll->ctx_array[i];
+		coll->ctx->id = i;
 		coll->ctx->contrib_local = false;
 		coll->ctx->contrib_prev = 0;
 		coll->ctx->contrib_next = 0;
 		coll->ctx->ring_buf = create_buf(NULL, 0);
 		coll->ctx->state = PMIXP_COLL_RING_NONE;
+		coll->ctx->send_list =  list_create(NULL);
+		slurm_mutex_init(&coll->ctx->lock);
 	}
+	coll->ctx = &coll->ctx_array[coll->ctx_cur];
 	coll->ctx->state = PMIXP_COLL_RING_SYNC;
 	coll->peers_cnt = _size;
 	coll->my_peerid = _rank;
-	coll->ctx->send_list =  list_create(NULL);
 
 	//coll->ring_buf = pmixp_server_buf_new();
 
@@ -253,6 +297,8 @@ static void _reset_coll_ring(pmixp_coll_ring_t *coll) {
 
 static void _progress_ring(pmixp_coll_ring_t *coll) {
 	int ret = 0;
+
+	slurm_mutex_lock(&coll->ctx->lock);
 	do {
 		switch(coll->ctx->state) {
 			case PMIXP_COLL_RING_NONE:
@@ -304,6 +350,7 @@ static void _progress_ring(pmixp_coll_ring_t *coll) {
 				break;
 		}
 	} while(ret);
+	slurm_mutex_unlock(&coll->ctx->lock);
 }
 
 void hexDump(char *desc, void *addr, int len) {
