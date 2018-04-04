@@ -13,11 +13,11 @@ CC=mpicc
 
 all: coll_ring
 
-pmixp_coll_ring.o: pmixp_coll_ring.c
-	$(CC) $(CFLAGS)  $(LDFLAGS) -c pmixp_coll_ring.c
+%.o : %.c
+	$(CC) -c $(CFLAGS) $< -o $@
 
 coll_ring: pmixp_coll_ring.o
-	$(CC) pmixp_coll_ring.o $(CFLAGS) $(LDFLAGS) $(SLURM_LIB) $(PMIX_LIB) -o coll_ring
+	$(CC) pmixp_coll_ring.o debug.o $(CFLAGS) $(LDFLAGS) $(SLURM_LIB) $(PMIX_LIB) -o coll_ring
 
 clean:
 	rm -f pmixp_coll_ring.o coll_ring
