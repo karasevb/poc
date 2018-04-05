@@ -1,3 +1,4 @@
+
 #include <stdio.h>
 #include <unistd.h>
 #include <pthread.h>
@@ -106,9 +107,9 @@ static void _msg_send_nb(pmixp_coll_ring_ctx_t *coll_ctx, uint32_t sender, char 
 	assert(DEBUG_MAGIC == coll->magic);
 
 	LOG("seq:%d/%d %d ---[%d]--> %d (size %d)", hdr.seq, hdr.ring_seq, coll->my_peerid, hdr.contrib_id, nodeid, hdr.msgsize);
-	MPI_Isend((void*) &hdr, sizeof(msg_hdr_t), MPI_BYTE, nodeid, 0, MPI_COMM_WORLD, &request);
+	MPI_Isend((void*) &hdr, sizeof(msg_hdr_t), MPI_BYTE, nodeid, coll->seq, MPI_COMM_WORLD, &request);
 	if (size) {
-		MPI_Isend((void*) data, size, MPI_BYTE, nodeid, 0, MPI_COMM_WORLD, &request);
+		MPI_Isend((void*) data, size, MPI_BYTE, nodeid, coll->seq, MPI_COMM_WORLD, &request);
 	}
 }
 
@@ -192,7 +193,8 @@ int coll_ring_contrib_local(pmixp_coll_ring_t *coll, char *data, size_t size,
 
 	slurm_mutex_unlock(&coll->ctx->lock);
 
-	_threadshift_progress(coll->ctx);
+	_progress_ring(coll->ctx);
+	//_threadshift_progress(coll->ctx);
 exit:
 	return ret;
 }
@@ -253,7 +255,8 @@ int coll_ring_contrib_prev(pmixp_coll_ring_t *coll, msg_hdr_t *hdr, Buf buf) {
 	slurm_mutex_unlock(&coll_ctx->lock);
 
 	/* ring coll progress */
-	_threadshift_progress(coll_ctx);
+	//_threadshift_progress(coll_ctx);
+	_progress_ring(coll_ctx);
 exit:
 	return ret;
 }
@@ -410,11 +413,9 @@ void cbfunc(pmixp_coll_ring_t *coll) {
 
 void ring_coll(pmixp_coll_ring_t *coll, char *data, size_t size) {
 	MPI_Status status;
-	MPI_Request request;
 	msg_hdr_t hdr = {0};
 	Buf buf;
 	int recv_flag;
-	int count;
 
 	LOG("coll seq %d, ", coll->seq);
 
@@ -433,26 +434,21 @@ void ring_coll(pmixp_coll_ring_t *coll, char *data, size_t size) {
 	}
 	int save_seq = coll->seq;
 
-	recv_flag = 1;
 	do {
-
-		if (coll->my_peerid == 0) {
-			sleep(0);
-		}
+		MPI_Iprobe(MPI_ANY_SOURCE, MPI_ANY_TAG, MPI_COMM_WORLD, &recv_flag, &status);
 		if (recv_flag) {
-			recv_flag = 0;
-			MPI_Irecv(&hdr, sizeof(msg_hdr_t), MPI_BYTE, MPI_ANY_SOURCE, 0, MPI_COMM_WORLD, &request);
-		}
-		//MPI_Get_count(&status, MPI_BYTE, &count );
+			//LOG("income hdr: src %d, tag %d, size %d", status.MPI_SOURCE, status.MPI_TAG, status._ucount);
+			if (status._ucount != sizeof(msg_hdr_t)) {
+				LOG("error: unexpected message size %d from %d, expected %d",  status._ucount, status.MPI_SOURCE, sizeof(msg_hdr_t));
+				abort();
+			}
+			MPI_Recv(&hdr, sizeof(msg_hdr_t), MPI_BYTE, MPI_ANY_SOURCE, MPI_ANY_TAG, MPI_COMM_WORLD, &status);
 
-		MPI_Test(&request, &recv_flag, &status);
-		//LOG("status %d", status);
-		if (recv_flag) {
-			MPI_Get_count(&status, MPI_BYTE, &count);
-			LOG("count %d", count);
+			MPI_Probe(MPI_ANY_SOURCE, MPI_ANY_TAG, MPI_COMM_WORLD, &status);
+			//LOG("income msg: src %d, tag %d, size %d", status.MPI_SOURCE, status.MPI_TAG, status._ucount);
 			if (hdr.msgsize) {
 				char *data_buf = xmalloc(hdr.msgsize);
-				MPI_Recv(data_buf, hdr.msgsize, MPI_BYTE, MPI_ANY_SOURCE, 0, MPI_COMM_WORLD, &status);
+				MPI_Recv(data_buf, hdr.msgsize, MPI_BYTE, MPI_ANY_SOURCE, MPI_ANY_TAG, MPI_COMM_WORLD, &status);
 				LOG("seq:%d/%d %d <--[%d]--- %d (size %d)",
 					hdr.seq, hdr.ring_seq, coll->my_peerid, hdr.contrib_id, hdr.nodeid, hdr.msgsize);
 				buf = create_buf(data_buf, hdr.msgsize);
@@ -463,19 +459,12 @@ void ring_coll(pmixp_coll_ring_t *coll, char *data, size_t size) {
 			coll_ring_contrib_prev(coll, &hdr, buf);
 
 			if ((save_seq == coll->seq) && !coll->ctx->contrib_local){
-				//sleep(2);
 				coll_ring_contrib_local(coll, data, size, cbfunc, NULL);
 			}
+			continue;
 		}
-		//LOG("state %d", coll->state);
-		if (!recv_flag) {
-			usleep(200);
-		}
+		usleep(200);
 	} while (save_seq == coll->seq);
-
-	if (!recv_flag) {
-		MPI_Request_free(&request);
-	}
 }
 
 int main(int argc, char *argv[]) {
@@ -483,8 +472,14 @@ int main(int argc, char *argv[]) {
 	char data[64];
 	size_t size = sizeof(data);
 	uint32_t i;
+	int status;
 
-	MPI_Init(&argc, &argv);
+	MPI_Init_thread(&argc, &argv, MPI_THREAD_MULTIPLE, &status);
+	if (status != MPI_THREAD_MULTIPLE)
+	{
+	    printf("Sorry, this MPI implementation does not support multiple threads\n");
+	    MPI_Abort(MPI_COMM_WORLD, 1);
+	}
 	MPI_Comm_rank(MPI_COMM_WORLD, &_rank);
 	MPI_Comm_size(MPI_COMM_WORLD, &_size);
 
@@ -499,17 +494,9 @@ int main(int argc, char *argv[]) {
 
 	ring_coll(coll, data, size);
 
-	MPI_Barrier(MPI_COMM_WORLD);
-	sleep(3);
-	if (_rank == 2) {
-		LOG("\n\nSecond coll");
-	} else {
-		LOG("");
-	}
-	MPI_Barrier(MPI_COMM_WORLD);
-
+	/* go to the next coll */
 	memset((void*)data, ((uint8_t)_rank << 4) +  (uint8_t)_rank , size);
-	//ring_coll(coll, data, size);
+	ring_coll(coll, data, size);
 
 	MPI_Barrier(MPI_COMM_WORLD);
 
