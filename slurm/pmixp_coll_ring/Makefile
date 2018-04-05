@@ -3,8 +3,8 @@ SLURM_SRC=/home/user/slurm/slurm-17-11-0-0rc2
 PMIX_INST=/home/user/pmix/v2.1/install
 OMPI_INST=/home/user/ompi/openmpi-v3.1.x-201803140301-169afcd/install
 
-CFLAGS= -Wall -I$(SLURM_SRC) -I$(SLURM_SRC)/src/plugins/mpi/pmix -I${OMPI_INST}/include
-LDFLAGS= -Wl,-rpath=$(SLURM_INST)/lib:$(SLURM_INST)/lib/slurm -g -ldl -lpthread
+CFLAGS= -Wall -I$(SLURM_SRC) -I$(SLURM_SRC)/src/plugins/mpi/pmix -I${OMPI_INST}/include -g -O0
+LDFLAGS= -Wl,-rpath=$(SLURM_INST)/lib:$(SLURM_INST)/lib/slurm -g -O0 -ldl -lpthread
 
 SLURM_LIB= -L$(SLURM_INST)/lib -lslurm -l:mpi_pmix_v2.so -L$(SLURM_INST)/lib/slurm -lslurmfull
 #PMIX_LIB= -L$(PMIX_INST)/lib -lpmix

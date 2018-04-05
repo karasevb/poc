@@ -12,7 +12,6 @@
 #define DEBUG_MAGIC 0xC011CAFE
 
 typedef enum {
-	PMIXP_COLL_RING_NONE,
 	PMIXP_COLL_RING_SYNC,
 	PMIXP_COLL_RING_COLLECT,
 	PMIXP_COLL_RING_DONE,
@@ -21,6 +20,7 @@ typedef enum {
 typedef struct {
 	void *super;
 	uint32_t id;
+	uint32_t seq;
 	bool contrib_local;
 	uint32_t contrib_prev;
 	uint32_t contrib_next;
@@ -35,7 +35,6 @@ typedef struct {
 typedef struct {
 	int magic;
 
-	uint32_t seq;
 	int my_peerid;
 	int peers_cnt;
 	void *cbfunc;
@@ -69,8 +68,8 @@ pthread_t progress_thread[_RING_CTX_NUM];
 typedef void (*ring_cbfunc_t)(pmixp_coll_ring_t *coll);
 
 #define LOG(format, args...) {				\
-	printf("%d:[%-30s:%4d] " format "\n",		\
-	      _rank, __func__, __LINE__, ## args);	\
+	printf("[%-30s:%4d] %d: " format "\n",		\
+	      __func__, __LINE__, _rank, ## args);	\
 }
 
 void hexDump(char *desc, void *addr, int len);
@@ -99,7 +98,7 @@ static void _msg_send_nb(pmixp_coll_ring_ctx_t *coll_ctx, uint32_t sender, char 
 	pmixp_coll_ring_t *coll = ctx_get_coll(coll_ctx);
 	hdr.nodeid = _rank;
 	hdr.msgsize = size;
-	hdr.seq = coll->seq;
+	hdr.seq = coll_ctx->seq;
 	hdr.ring_seq = coll_ctx->contrib_next;
 	hdr.contrib_id = sender;
 	MPI_Request request;
@@ -107,9 +106,9 @@ static void _msg_send_nb(pmixp_coll_ring_ctx_t *coll_ctx, uint32_t sender, char 
 	assert(DEBUG_MAGIC == coll->magic);
 
 	LOG("seq:%d/%d %d ---[%d]--> %d (size %d)", hdr.seq, hdr.ring_seq, coll->my_peerid, hdr.contrib_id, nodeid, hdr.msgsize);
-	MPI_Isend((void*) &hdr, sizeof(msg_hdr_t), MPI_BYTE, nodeid, coll->seq, MPI_COMM_WORLD, &request);
+	MPI_Isend((void*) &hdr, sizeof(msg_hdr_t), MPI_BYTE, nodeid, coll_ctx->seq, MPI_COMM_WORLD, &request);
 	if (size) {
-		MPI_Isend((void*) data, size, MPI_BYTE, nodeid, coll->seq, MPI_COMM_WORLD, &request);
+		MPI_Isend((void*) data, size, MPI_BYTE, nodeid, coll_ctx->seq, MPI_COMM_WORLD, &request);
 	}
 }
 
@@ -122,37 +121,20 @@ static void _coll_send_all(pmixp_coll_ring_ctx_t *coll_ctx) {
 		msg = list_dequeue(coll_ctx->send_list);
 		_msg_send_nb(coll_ctx, msg->contrib_id, msg->ptr, msg->size);
 		/* test */
-		if (_rank == 1)
-			_msg_send_nb(coll_ctx, msg->contrib_id, msg->ptr, msg->size);
+		//if (_rank == 1)
+		//	_msg_send_nb(coll_ctx, msg->contrib_id, msg->ptr, msg->size);
 		/* */
 		coll_ctx->contrib_next++;
 		free(msg);
 	}
 }
 
-void * _coll_progress_thread(void *args) {
-	pmixp_coll_ring_ctx_t *coll_ctx = args;
-
-	_progress_ring(coll_ctx);
-	return NULL;
-}
-
-void _threadshift_progress(pmixp_coll_ring_ctx_t *coll_ctx) {
-	assert(coll_ctx);
-
-	int rc = pthread_create(&progress_thread[coll_ctx->id], NULL, _coll_progress_thread, (void*)coll_ctx);
-	if (rc != 0) {
-	    printf("error: can't create progress thread, rc = %d\n", rc);
-	    abort();
-	}
-}
-
-
 int coll_ring_contrib_local(pmixp_coll_ring_t *coll, char *data, size_t size,
 			    void *cbfunc, void *cbdata) {
 	int ret = SLURM_SUCCESS;
 	ring_data_t *msg;
 	assert(coll->ctx);
+	pmixp_coll_ring_ctx_t *coll_ctx = coll->ctx;
 
 	slurm_mutex_lock(&coll->ctx->lock);
 
@@ -164,37 +146,36 @@ int coll_ring_contrib_local(pmixp_coll_ring_t *coll, char *data, size_t size,
 	}
 
 	/* save & mark local contribution */
-	if (!size_buf(coll->ctx->ring_buf)) {
-		pmixp_server_buf_reserve(coll->ctx->ring_buf, size * coll->peers_cnt);
-	} else if(remaining_buf(coll->ctx->ring_buf) < size) {
+	if (!size_buf(coll_ctx->ring_buf)) {
+		pmixp_server_buf_reserve(coll_ctx->ring_buf, size * coll->peers_cnt);
+	} else if(remaining_buf(coll_ctx->ring_buf) < size) {
 		/* grow sbuf size to 15% */
-		size_t new_size = size_buf(coll->ctx->ring_buf) * 0.15 + size_buf(coll->ctx->ring_buf);
-		pmixp_server_buf_reserve(coll->ctx->ring_buf, new_size);
+		size_t new_size = size_buf(coll_ctx->ring_buf) * 0.15 + size_buf(coll_ctx->ring_buf);
+		pmixp_server_buf_reserve(coll_ctx->ring_buf, new_size);
 	}
 
-	memcpy(get_buf_data(coll->ctx->ring_buf) + get_buf_offset(coll->ctx->ring_buf),
+	memcpy(get_buf_data(coll_ctx->ring_buf) + get_buf_offset(coll_ctx->ring_buf),
 	       data, size);
 
 	msg = malloc(sizeof(ring_data_t));
-	msg->ptr = get_buf_data(coll->ctx->ring_buf) + get_buf_offset(coll->ctx->ring_buf);
+	msg->ptr = get_buf_data(coll_ctx->ring_buf) + get_buf_offset(coll_ctx->ring_buf);
 	msg->size = size;
 	msg->contrib_id = coll->my_peerid;
 	//LOG("send next add %d", size);
 
-	list_enqueue(coll->ctx->send_list, msg);
+	list_enqueue(coll_ctx->send_list, msg);
 
-	set_buf_offset(coll->ctx->ring_buf, get_buf_offset(coll->ctx->ring_buf) + size);
+	set_buf_offset(coll_ctx->ring_buf, get_buf_offset(coll_ctx->ring_buf) + size);
 
-	coll->ctx->contrib_local = true;
+	coll_ctx->contrib_local = true;
 
 	/* setup callback info */
 	coll->cbfunc = cbfunc;
 	coll->cbdata = cbdata;
 
-	slurm_mutex_unlock(&coll->ctx->lock);
+	slurm_mutex_unlock(&coll_ctx->lock);
 
-	_progress_ring(coll->ctx);
-	//_threadshift_progress(coll->ctx);
+	_progress_ring(coll_ctx);
 exit:
 	return ret;
 }
@@ -214,17 +195,18 @@ int coll_ring_contrib_prev(pmixp_coll_ring_t *coll, msg_hdr_t *hdr, Buf buf) {
 		goto exit;
 	}
 
-	if (hdr->ring_seq != coll->ctx->contrib_prev) {
-		LOG("error: unexpected msg seq number %d, expect %d", hdr->ring_seq, coll->ctx->contrib_prev);
-		goto exit;
-	}
-
 	slurm_mutex_lock(&coll->ctx->lock);
 
 	/* shift the coll context if that contrib belongs to the next coll  */
-	if ((coll->seq +1) == hdr->seq) {
+	if ((coll_ctx->seq +1) == hdr->seq) {
+		pmixp_debug_hang(0);
 		coll_ctx = _get_coll_ctx_shift(coll);
 	}
+
+	//if (hdr->ring_seq != coll_ctx->contrib_prev) {
+	//	LOG("error: unexpected msg seq number %d, expect %d, coll seq %d/%d", hdr->ring_seq, coll->ctx->contrib_prev, coll->ctx->seq, coll_ctx->seq);
+	//	goto exit;
+	//}
 
 	/* save & mark contribution */
 	if (!size_buf(coll_ctx->ring_buf)) {
@@ -255,20 +237,10 @@ int coll_ring_contrib_prev(pmixp_coll_ring_t *coll, msg_hdr_t *hdr, Buf buf) {
 	slurm_mutex_unlock(&coll_ctx->lock);
 
 	/* ring coll progress */
-	//_threadshift_progress(coll_ctx);
 	_progress_ring(coll_ctx);
 exit:
 	return ret;
 }
-
-void handle(int s) {
-	while(1) {
-		LOG("%d", _rank)
-		sleep(1);
-	}
-	return;
-}
-
 
 pmixp_coll_ring_t *coll_ring_get() {
 	pmixp_coll_ring_t *coll = xmalloc(sizeof(*coll));
@@ -281,11 +253,12 @@ pmixp_coll_ring_t *coll_ring_get() {
 	for (i = 0; i < _RING_CTX_NUM; i++) {
 		coll->ctx = &coll->ctx_array[i];
 		coll->ctx->id = i;
+		coll->ctx->seq = i;
 		coll->ctx->contrib_local = false;
 		coll->ctx->contrib_prev = 0;
 		coll->ctx->contrib_next = 0;
 		coll->ctx->ring_buf = create_buf(NULL, 0);
-		coll->ctx->state = PMIXP_COLL_RING_NONE;
+		coll->ctx->state = PMIXP_COLL_RING_SYNC;
 		coll->ctx->send_list =  list_create(NULL);
 		coll->ctx->super = (void*)coll;
 		slurm_mutex_init(&coll->ctx->lock);
@@ -300,37 +273,39 @@ pmixp_coll_ring_t *coll_ring_get() {
 	return coll;
 }
 
-static void _reset_coll_ring(pmixp_coll_ring_t *coll) {
+static void _reset_coll_ring(pmixp_coll_ring_ctx_t *coll_ctx) {
+	pmixp_coll_ring_t *coll = ctx_get_coll(coll_ctx);
 	assert(DEBUG_MAGIC == coll->magic);
 	ring_cbfunc_t cbfunc;
-	coll->ctx->state = PMIXP_COLL_RING_NONE;
-	coll->ctx->contrib_local = false;
-	coll->ctx->contrib_prev = 0;
-	coll->ctx->contrib_next = 0;
-	coll->seq++;
+
 	cbfunc = coll->cbfunc;
-	cbfunc(coll);
-	set_buf_offset(coll->ctx->ring_buf, 0);
+	if (cbfunc) {
+		cbfunc(coll);
+	}
+
+	coll_ctx->state = PMIXP_COLL_RING_SYNC;
+	coll_ctx->contrib_local = false;
+	coll_ctx->contrib_prev = 0;
+	coll_ctx->contrib_next = 0;
+	coll_ctx->seq += _RING_CTX_NUM;
+	set_buf_offset(coll_ctx->ring_buf, 0);
 }
 
 static void _progress_ring(pmixp_coll_ring_ctx_t *coll_ctx) {
 	int ret = 0;
 	pmixp_coll_ring_t *coll = ctx_get_coll(coll_ctx);
+	//static int count = 0;
 
 	assert(DEBUG_MAGIC == coll->magic);
 
 	slurm_mutex_lock(&coll_ctx->lock);
 	do {
 		switch(coll_ctx->state) {
-			case PMIXP_COLL_RING_NONE:
-				/* nothing to do, this collective is not started yet */
-				break;
 			case PMIXP_COLL_RING_SYNC:
 				//LOG("PMIXP_COLL_RING_SYNC");
 				if (coll_ctx->contrib_local || coll_ctx->contrib_prev) {
 					coll_ctx->state = PMIXP_COLL_RING_COLLECT;
 					ret = true;
-					//LOG("PMIXP_COLL_RING_SYNC -> PMIXP_COLL_RING_COLLECT");
 				} else {
 					ret = false;
 				}
@@ -338,37 +313,24 @@ static void _progress_ring(pmixp_coll_ring_ctx_t *coll_ctx) {
 			case PMIXP_COLL_RING_COLLECT:
 				ret = false;
 				//LOG("PMIXP_COLL_RING_COLLECT");
-				//if (0 != _rank)
 				_coll_send_all(coll_ctx);
-				//else (coll->ctx->contrib_prev )
 				if (!coll_ctx->contrib_local) {
-					//LOG("PMIXP_COLL_RING_COLLECT: wait for local contrib")
 					ret = false;
 				} else if ((coll->peers_cnt - 1) == coll->ctx->contrib_prev) {
-					_coll_send_all(coll_ctx);
 					coll_ctx->state = PMIXP_COLL_RING_DONE;
-					//LOG("PMIXP_COLL_RING_COLLECT -> PMIXP_COLL_RING_DONE");
 					ret = true;
 					pmixp_debug_hang(0);
 				}
 				break;
 			case PMIXP_COLL_RING_DONE:
-				LOG("PMIXP_COLL_RING_DONE");
 				ret = false;
-				/* test */
-				//if (0 == coll->my_peerid) {
-				//	sleep(5);
-				//}
-				/* */
-				_reset_coll_ring(coll);
-				/* disable the old coll */
-				coll_ctx->state = PMIXP_COLL_RING_NONE;
+				_coll_send_all(coll->ctx);
+				_reset_coll_ring(coll_ctx);
 				/* shift to new coll */
 				coll->ctx = _get_coll_ctx_shift(coll);
 				coll->ctx_cur = coll->ctx->id;
 				coll->ctx->state = PMIXP_COLL_RING_SYNC;
 				/* send the all collected ring contribs for the new collective */
-				_coll_send_all(coll->ctx);
 				break;
 		}
 	} while(ret);
@@ -405,10 +367,11 @@ void hexDump(char *desc, void *addr, int len) {
 
 void cbfunc(pmixp_coll_ring_t *coll) {
 	assert(DEBUG_MAGIC == coll->magic);
-	LOG("coll seq %d: result buf size %d, used %d", coll->seq, size_buf(coll->ctx->ring_buf), get_buf_offset(coll->ctx->ring_buf));
+	LOG("coll seq %d: result buf size %d, used %d", coll->ctx->seq, size_buf(coll->ctx->ring_buf), get_buf_offset(coll->ctx->ring_buf));
 	if (1 == coll->my_peerid) {
 		hexDump("ring fini", get_buf_data(coll->ctx->ring_buf), get_buf_offset(coll->ctx->ring_buf));
 	}
+	else LOG("cbfunc coll %d", coll->ctx->seq);
 }
 
 void ring_coll(pmixp_coll_ring_t *coll, char *data, size_t size) {
@@ -416,30 +379,43 @@ void ring_coll(pmixp_coll_ring_t *coll, char *data, size_t size) {
 	msg_hdr_t hdr = {0};
 	Buf buf;
 	int recv_flag;
+	pmixp_coll_ring_ctx_t *coll_ctx;
+	pmixp_coll_ring_state_t state = PMIXP_COLL_RING_COLLECT;
+	int wait = 0;
+	int seq, i;
+	int delay_usec = 100000;
+	int wait_usec = 0;
+	int local_contrib_delay = 0;
 
-	LOG("coll seq %d, ", coll->seq);
+	LOG("start %d", seq = coll->ctx->seq);
 
 	assert(DEBUG_MAGIC == coll->magic);
 
-#if 1
+#if 0
 	coll_ring_contrib_local(coll, data, size, cbfunc, NULL);
+	state = coll->ctx->state;
 #else
 	if (0 != coll->my_peerid) {
 		coll_ring_contrib_local(coll, data, size, cbfunc, NULL);
-	}
-	else pmixp_debug_hang(0);
-#endif
-	if ( _rank == 0) {
+		state = coll->ctx->state;
+	} else {
 		pmixp_debug_hang(0);
 	}
-	int save_seq = coll->seq;
-
+#endif
+	/* */
+	if ((seq == 0) && (0 == coll->my_peerid)) {
+		wait = 1;
+		wait_usec = 3 * 1000000;
+		local_contrib_delay = 3 * 1000000;
+	}
+	/* save orig ctx */
+	coll_ctx = coll->ctx;
 	do {
 		MPI_Iprobe(MPI_ANY_SOURCE, MPI_ANY_TAG, MPI_COMM_WORLD, &recv_flag, &status);
 		if (recv_flag) {
 			//LOG("income hdr: src %d, tag %d, size %d", status.MPI_SOURCE, status.MPI_TAG, status._ucount);
 			if (status._ucount != sizeof(msg_hdr_t)) {
-				LOG("error: unexpected message size %d from %d, expected %d",  status._ucount, status.MPI_SOURCE, sizeof(msg_hdr_t));
+				LOG("error: unexpected message size %lu from %d, expected %lu",  status._ucount, status.MPI_SOURCE, sizeof(msg_hdr_t));
 				abort();
 			}
 			MPI_Recv(&hdr, sizeof(msg_hdr_t), MPI_BYTE, MPI_ANY_SOURCE, MPI_ANY_TAG, MPI_COMM_WORLD, &status);
@@ -457,21 +433,36 @@ void ring_coll(pmixp_coll_ring_t *coll, char *data, size_t size) {
 			}
 
 			coll_ring_contrib_prev(coll, &hdr, buf);
-
-			if ((save_seq == coll->seq) && !coll->ctx->contrib_local){
-				coll_ring_contrib_local(coll, data, size, cbfunc, NULL);
-			}
-			continue;
+			state = coll_ctx->state;
 		}
-		usleep(200);
-	} while (save_seq == coll->seq);
+		if ((0 == coll->my_peerid) && (state == PMIXP_COLL_RING_SYNC)) {
+			wait_usec -= delay_usec;
+			if (wait_usec < 0) {
+				wait = 0;
+			}
+
+		}
+		if ((local_contrib_delay < 0)) {
+			//LOG("seq %d, coll_ctx->contrib_local %d", coll_ctx->seq, coll_ctx->contrib_local);
+			if (seq == coll_ctx->seq && !coll_ctx->contrib_local){
+				coll_ring_contrib_local(coll, data, size, cbfunc, NULL);
+				state = coll_ctx->state;
+			}
+		}
+		local_contrib_delay -= delay_usec;
+		usleep(delay_usec);
+		//LOG("coll %d", seq);
+	} while ((state != PMIXP_COLL_RING_SYNC) || wait);
+	LOG("exit %d", seq);
+	for (i = 0; i < _RING_CTX_NUM; i++) {
+		LOG("\t coll %d buf size %d", i, size_buf(coll->ctx_array[i].ring_buf));
+	}
 }
 
 int main(int argc, char *argv[]) {
 	pmixp_coll_ring_t *coll = NULL;
 	char data[64];
 	size_t size = sizeof(data);
-	uint32_t i;
 	int status;
 
 	MPI_Init_thread(&argc, &argv, MPI_THREAD_MULTIPLE, &status);
@@ -498,11 +489,10 @@ int main(int argc, char *argv[]) {
 	memset((void*)data, ((uint8_t)_rank << 4) +  (uint8_t)_rank , size);
 	ring_coll(coll, data, size);
 
-	MPI_Barrier(MPI_COMM_WORLD);
+	//memset((void*)data, (uint8_t)_rank, size);
+	//ring_coll(coll, data, size);
 
-	for (i = 0; i < _RING_CTX_NUM; i++) {
-		pthread_join(progress_thread[i], NULL);
-	}
+	MPI_Barrier(MPI_COMM_WORLD);
 	xfree(coll);
 	MPI_Finalize();
 
