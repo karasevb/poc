@@ -23,6 +23,7 @@ typedef struct {
 	uint32_t seq;
 	bool contrib_local;
 	uint32_t contrib_prev;
+	bool *contrib_map;
 	uint32_t contrib_next;
 	pmixp_coll_ring_state_t state;
 	Buf ring_buf;
@@ -50,15 +51,16 @@ typedef struct {
 	uint32_t type;
 	uint32_t contrib_id;
 	uint32_t seq;
-	uint32_t ring_seq;
+	uint32_t hop_seq;
 	uint32_t nodeid;
 	uint32_t msgsize;
 } msg_hdr_t;
 
 typedef struct {
-	char *ptr;
 	size_t size;
+	char *ptr;
 	uint32_t contrib_id;
+	uint32_t hop_seq;
 } ring_data_t;
 
 static int _rank, _size;
@@ -93,19 +95,19 @@ static inline pmixp_coll_ring_t *ctx_get_coll(pmixp_coll_ring_ctx_t *coll_ctx) {
 	return (pmixp_coll_ring_t*)(coll_ctx->super);
 }
 
-static void _msg_send_nb(pmixp_coll_ring_ctx_t *coll_ctx, uint32_t sender, char *data, size_t size) {
+static void _msg_send_nb(pmixp_coll_ring_ctx_t *coll_ctx, uint32_t sender, uint32_t hop_seq, char *data, size_t size) {
 	msg_hdr_t hdr;
 	pmixp_coll_ring_t *coll = ctx_get_coll(coll_ctx);
 	hdr.nodeid = _rank;
 	hdr.msgsize = size;
 	hdr.seq = coll_ctx->seq;
-	hdr.ring_seq = coll_ctx->contrib_next;
+	hdr.hop_seq = hop_seq;
 	hdr.contrib_id = sender;
 	MPI_Request request;
 	int nodeid = _next_id(coll);
 	assert(DEBUG_MAGIC == coll->magic);
 
-	LOG("seq:%d/%d %d ---[%d]--> %d (size %d)", hdr.seq, hdr.ring_seq, coll->my_peerid, hdr.contrib_id, nodeid, hdr.msgsize);
+	LOG("coll/hop:%d/%d %d ---[%d]--> %d (size %d)", hdr.seq, hdr.hop_seq, coll->my_peerid, hdr.contrib_id, nodeid, hdr.msgsize);
 	MPI_Isend((void*) &hdr, sizeof(msg_hdr_t), MPI_BYTE, nodeid, coll_ctx->seq, MPI_COMM_WORLD, &request);
 	if (size) {
 		MPI_Isend((void*) data, size, MPI_BYTE, nodeid, coll_ctx->seq, MPI_COMM_WORLD, &request);
@@ -119,11 +121,10 @@ static void _coll_send_all(pmixp_coll_ring_ctx_t *coll_ctx) {
 	//LOG("send count %d", list_count(coll->ctx->send_list));
 	while (!list_is_empty(coll_ctx->send_list)) {
 		msg = list_dequeue(coll_ctx->send_list);
-		_msg_send_nb(coll_ctx, msg->contrib_id, msg->ptr, msg->size);
-		/* test */
-		//if (_rank == 1)
-		//	_msg_send_nb(coll_ctx, msg->contrib_id, msg->ptr, msg->size);
-		/* */
+		_msg_send_nb(coll_ctx, msg->contrib_id, msg->hop_seq, msg->ptr, msg->size);
+		/* double send test*/
+		if (_rank == 1)
+			_msg_send_nb(coll_ctx, msg->contrib_id, msg->hop_seq, msg->ptr, msg->size);
 		coll_ctx->contrib_next++;
 		free(msg);
 	}
@@ -161,6 +162,7 @@ int coll_ring_contrib_local(pmixp_coll_ring_t *coll, char *data, size_t size,
 	msg->ptr = get_buf_data(coll_ctx->ring_buf) + get_buf_offset(coll_ctx->ring_buf);
 	msg->size = size;
 	msg->contrib_id = coll->my_peerid;
+	msg->hop_seq = 0;
 	//LOG("send next add %d", size);
 
 	list_enqueue(coll_ctx->send_list, msg);
@@ -192,6 +194,7 @@ int coll_ring_contrib_prev(pmixp_coll_ring_t *coll, msg_hdr_t *hdr, Buf buf) {
 
 	if (hdr->nodeid != _prev_id(coll)) {
 		LOG("unexpected peerid %d, expect %d", hdr->nodeid, _prev_id(coll));
+		slurm_mutex_unlock(&coll_ctx->lock);
 		goto exit;
 	}
 
@@ -203,10 +206,23 @@ int coll_ring_contrib_prev(pmixp_coll_ring_t *coll, msg_hdr_t *hdr, Buf buf) {
 		coll_ctx = _get_coll_ctx_shift(coll);
 	}
 
-	//if (hdr->ring_seq != coll_ctx->contrib_prev) {
-	//	LOG("error: unexpected msg seq number %d, expect %d, coll seq %d/%d", hdr->ring_seq, coll->ctx->contrib_prev, coll->ctx->seq, coll_ctx->seq);
-	//	goto exit;
-	//}
+	/* compute the actual hops of ring: (src - dst + size) % size */
+	uint32_t seq_expexted = (coll->my_peerid + coll->peers_cnt - hdr->contrib_id) % coll->peers_cnt - 1;
+	if (hdr->hop_seq != seq_expexted) {
+		LOG("error: unexpected msg seq number %d, expect %d, coll seq %d/%d", hdr->hop_seq, seq_expexted, coll->ctx->seq, coll_ctx->seq);
+		slurm_mutex_unlock(&coll_ctx->lock);
+		goto exit;
+	}
+
+	if (coll_ctx->contrib_map[hdr->contrib_id]) {
+		LOG("warning: double receiving was detected from %d, rejected", hdr->contrib_id);
+		slurm_mutex_unlock(&coll_ctx->lock);
+		goto exit;
+	}
+	if (2 == _rank)
+		LOG("mark %d", hdr->contrib_id);
+	coll_ctx->contrib_map[hdr->contrib_id]++;
+
 
 	/* save & mark contribution */
 	if (!size_buf(coll_ctx->ring_buf)) {
@@ -230,6 +246,8 @@ int coll_ring_contrib_prev(pmixp_coll_ring_t *coll, msg_hdr_t *hdr, Buf buf) {
 		msg->size = size;
 		msg->ptr = data_dst;
 		msg->contrib_id = hdr->contrib_id;
+		/* increasing hop sequence */
+		msg->hop_seq = hdr->hop_seq +1;
 		list_enqueue(coll->ctx->send_list, msg);
 	}
 
@@ -239,6 +257,7 @@ int coll_ring_contrib_prev(pmixp_coll_ring_t *coll, msg_hdr_t *hdr, Buf buf) {
 	/* ring coll progress */
 	_progress_ring(coll_ctx);
 exit:
+	free_buf(buf);
 	return ret;
 }
 
@@ -261,6 +280,8 @@ pmixp_coll_ring_t *coll_ring_get() {
 		coll->ctx->state = PMIXP_COLL_RING_SYNC;
 		coll->ctx->send_list =  list_create(NULL);
 		coll->ctx->super = (void*)coll;
+		coll->ctx->contrib_map = xmalloc(sizeof(bool) * _size);
+		memset(coll->ctx->contrib_map, 0, sizeof(bool) * _size);
 		slurm_mutex_init(&coll->ctx->lock);
 	}
 	coll->ctx = &coll->ctx_array[coll->ctx_cur];
@@ -287,6 +308,7 @@ static void _reset_coll_ring(pmixp_coll_ring_ctx_t *coll_ctx) {
 	coll_ctx->contrib_local = false;
 	coll_ctx->contrib_prev = 0;
 	coll_ctx->contrib_next = 0;
+	memset(coll->ctx->contrib_map, 0, sizeof(bool) * _size);
 	coll_ctx->seq += _RING_CTX_NUM;
 	set_buf_offset(coll_ctx->ring_buf, 0);
 }
@@ -419,14 +441,13 @@ void ring_coll(pmixp_coll_ring_t *coll, char *data, size_t size) {
 				abort();
 			}
 			MPI_Recv(&hdr, sizeof(msg_hdr_t), MPI_BYTE, MPI_ANY_SOURCE, MPI_ANY_TAG, MPI_COMM_WORLD, &status);
-
 			MPI_Probe(MPI_ANY_SOURCE, MPI_ANY_TAG, MPI_COMM_WORLD, &status);
 			//LOG("income msg: src %d, tag %d, size %d", status.MPI_SOURCE, status.MPI_TAG, status._ucount);
 			if (hdr.msgsize) {
 				char *data_buf = xmalloc(hdr.msgsize);
 				MPI_Recv(data_buf, hdr.msgsize, MPI_BYTE, MPI_ANY_SOURCE, MPI_ANY_TAG, MPI_COMM_WORLD, &status);
-				LOG("seq:%d/%d %d <--[%d]--- %d (size %d)",
-					hdr.seq, hdr.ring_seq, coll->my_peerid, hdr.contrib_id, hdr.nodeid, hdr.msgsize);
+				LOG("coll/hop:%d/%d %d <--[%d]--- %d (size %d)",
+					hdr.seq, hdr.hop_seq, coll->my_peerid, hdr.contrib_id, hdr.nodeid, hdr.msgsize);
 				buf = create_buf(data_buf, hdr.msgsize);
 			} else {
 				buf = create_buf(NULL, 0);//pmixp_server_buf_new();
