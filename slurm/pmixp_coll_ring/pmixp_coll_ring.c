@@ -294,6 +294,20 @@ pmixp_coll_ring_t *coll_ring_get() {
 	return coll;
 }
 
+void coll_finalize(pmixp_coll_ring_t *coll) {
+	int i;
+
+	for (i = 0; i < _RING_CTX_NUM; i++) {
+		pmixp_coll_ring_ctx_t *coll_ctx = &coll->ctx_array[i];
+		xfree(coll_ctx->contrib_map);
+		free_buf(coll_ctx->ring_buf);
+		list_destroy(coll_ctx->send_list);
+		xfree(coll_ctx->contrib_map);
+		slurm_mutex_destroy(&coll_ctx->lock);
+	}
+	xfree(coll);
+}
+
 static void _reset_coll_ring(pmixp_coll_ring_ctx_t *coll_ctx) {
 	pmixp_coll_ring_t *coll = ctx_get_coll(coll_ctx);
 	assert(DEBUG_MAGIC == coll->magic);
@@ -514,7 +528,7 @@ int main(int argc, char *argv[]) {
 	//ring_coll(coll, data, size);
 
 	MPI_Barrier(MPI_COMM_WORLD);
-	xfree(coll);
+	coll_finalize(coll);
 	MPI_Finalize();
 
 	return 0;
