@@ -2,6 +2,8 @@
 #include <stdlib.h>
 #include <unistd.h>
 
+#include <pmix.h>
+
 #include "pmix_config.h"
 #include "pmix_globals.h"
 
@@ -22,14 +24,17 @@ bool test_verbose = 0;
 #define TEST_SIGN_FMT_unsigned lu
 #define TEST_SIGN_FMT_signed ld
 
-#define TEST_PACK_FN_TEMPLATE(_type, _pmix_type, _print_fmt, _min, _max) \
-int integer_pack_test_ ##_type##_fn(pmix_bfrops_module_t *bfrop)        \
+#define TEST_PACK_INT_FN_TEMPLATE(_type, _pmix_type, _print_fmt, _min, _max) \
+int integer_pack_int_test_ ##_type##_fn(pmix_bfrops_module_t *bfrop)    \
 {                                                                       \
     _type i;                                                            \
     _type min = _min;                                                   \
     _type max = _max;                                                   \
     int ret = PMIX_SUCCESS;                                             \
-    printf("%s: min "_print_fmt", max = "_print_fmt"\n", __func__, min, max);             \
+    if (test_verbose) {                                                 \
+        printf("%s: min "_print_fmt", max = "_print_fmt"\n",            \
+               __func__, min, max);                                     \
+    }                                                                   \
     for (i = min; i < max; i++) {                                       \
         pmix_buffer_t *buffer = PMIX_NEW(pmix_buffer_t);                \
         _type src = i;                                                  \
@@ -49,7 +54,8 @@ int integer_pack_test_ ##_type##_fn(pmix_bfrops_module_t *bfrop)        \
             return ret;                                                 \
         }                                                               \
         if (src != dst) {                                               \
-            fprintf(stderr, "ERR values are not match, "_print_fmt"\n", dst);    \
+            fprintf(stderr, "ERR values are not match, "_print_fmt"\n", \
+                    dst);                                               \
             return PMIX_ERROR;                                          \
         }                                                               \
         if (test_verbose) {                                             \
@@ -57,7 +63,9 @@ int integer_pack_test_ ##_type##_fn(pmix_bfrops_module_t *bfrop)        \
         }                                                               \
         PMIX_RELEASE(buffer);                                           \
     }                                                                   \
-    printf("%s: test OK\n", __func__);                                  \
+    if (test_verbose) {                                                 \
+        printf("%s: test OK\n", __func__);                              \
+    }                                                                   \
     return PMIX_SUCCESS;                                                \
 }
 
@@ -72,7 +80,7 @@ int init(pmix_bfrops_module_t **bfrop)
 
     /* initialize install dirs code */
     if (PMIX_SUCCESS != (ret = pmix_mca_base_framework_open(&pmix_pinstalldirs_base_framework, 0))) {
-        fprintf(stderr, "pmix_pinstalldirs_base_open() failed -- process will likely abort (%s:%d, returned %d instead of PMIX_SUCCESS)\n",
+        fprintf(stderr, "pmix_pinstalldirs_base_open() failed -- process will likely abort (%s:%d: returned %d instead of PMIX_SUCCESS)\n",
                 __FILE__, __LINE__, ret);
         return ret;
     }
@@ -103,7 +111,7 @@ int init(pmix_bfrops_module_t **bfrop)
     *bfrop = pmix_bfrops_base_assign_module(NULL);
 
     if (NULL == *bfrop) {
-        fprintf(stderr, "%s:%d, pmix_bfrops_base_assign_module() cannot assign module, %d\n",
+        fprintf(stderr, "%s:%d: pmix_bfrops_base_assign_module() cannot assign module, %d\n",
                 __FILE__, __LINE__, ret);
         return -1;
     }
@@ -111,7 +119,7 @@ int init(pmix_bfrops_module_t **bfrop)
 }
 
 #if 0
-int integer_pack_test_int64(pmix_bfrops_module_t *bfrop)
+int integer_pack_int_test_int64(pmix_bfrops_module_t *bfrop)
 {
     uint64_t i;
     uint64_t min = 0;
@@ -145,13 +153,216 @@ int integer_pack_test_int64(pmix_bfrops_module_t *bfrop)
 }
 #endif
 
+TEST_PACK_INT_FN_TEMPLATE(int64_t, PMIX_INT64, "%ld", -1000, 1000)
+TEST_PACK_INT_FN_TEMPLATE(uint64_t, PMIX_UINT64, "%lu", 0, 3000)
+TEST_PACK_INT_FN_TEMPLATE(int32_t, PMIX_INT32, "%d", -1000, 4000)
+TEST_PACK_INT_FN_TEMPLATE(uint32_t, PMIX_UINT32, "%u", 0, 5000)
+TEST_PACK_INT_FN_TEMPLATE(int16_t, PMIX_INT16, "%d", SHRT_MIN, SHRT_MAX)
+TEST_PACK_INT_FN_TEMPLATE(uint16_t, PMIX_UINT16, "%u", 0, USHRT_MAX)
 
-TEST_PACK_FN_TEMPLATE(int64_t, PMIX_INT64, "%ld", LONG_MIN, LONG_MAX)
-TEST_PACK_FN_TEMPLATE(uint64_t, PMIX_UINT64, "%lu", 0, ULONG_MAX)
-TEST_PACK_FN_TEMPLATE(int32_t, PMIX_INT32, "%d", INT_MIN, INT_MAX)
-TEST_PACK_FN_TEMPLATE(uint32_t, PMIX_UINT32, "%u", 0, UINT_MAX)
-TEST_PACK_FN_TEMPLATE(int16_t, PMIX_INT16, "%d", SHRT_MIN, SHRT_MAX)
-TEST_PACK_FN_TEMPLATE(uint16_t, PMIX_UINT16, "%u", 0, USHRT_MAX)
+static int test_int_pack(pmix_bfrops_module_t *bfrop)
+{
+    int i, ret;
+    integer_pack_test_fn test_fn_array[] = { integer_pack_int_test_int64_t_fn,
+                                             integer_pack_int_test_uint64_t_fn,
+                                             integer_pack_int_test_int32_t_fn,
+                                             integer_pack_int_test_uint32_t_fn,
+                                             integer_pack_int_test_int16_t_fn,
+                                             integer_pack_int_test_uint16_t_fn,
+                                             NULL };
+
+    for (i = 0; test_fn_array[i] != NULL; i++) {
+        ret = test_fn_array[i](bfrop);
+        if (ret != PMIX_SUCCESS) {
+            fprintf(stderr, "Test ERROR\n");
+            return ret;
+        }
+    }
+    return 0;
+}
+
+static int test_pinfo_pack(pmix_bfrops_module_t *bfrop)
+{
+    int i, ret = 0;
+    pmix_buffer_t *buffer = PMIX_NEW(pmix_buffer_t);
+    pmix_kval_t *kv = PMIX_NEW(pmix_kval_t), *kv2 = PMIX_NEW(pmix_kval_t);
+    pmix_proc_info_t *pinfo;
+
+    kv->key = strdup("proc_info");
+    kv->value = (pmix_value_t*)malloc(sizeof(pmix_value_t));
+    kv->value->type = PMIX_PROC_INFO;
+    PMIX_PROC_INFO_CREATE(pinfo, 1);
+    kv->value->data.pinfo = pinfo;
+
+    pinfo->executable_name = strdup("executable_name");
+    pinfo->exit_code = -1;
+    pinfo->hostname = strdup("hostname");
+    pinfo->pid = 444;
+    PMIX_PROC_CONSTRUCT(&pinfo->proc);
+    PMIX_PROC_LOAD(&pinfo->proc, "myproc.nspace", 2);
+    pinfo->state = PMIX_ERR_NOT_IMPLEMENTED;
+
+    ret = bfrop->pack(buffer, kv, 1, PMIX_KVAL);
+    if (ret != PMIX_SUCCESS) {
+        fprintf(stderr, "%s:%d: pack PMIX_INFO ERR %d\n",
+                __FILE__, __LINE__, ret);
+        return ret;
+    }
+
+    PMIX_RELEASE(kv);
+    PMIX_RELEASE(kv2);
+    PMIX_RELEASE(buffer);
+
+    return ret;
+}
+
+static int test_proc_pack(pmix_bfrops_module_t *bfrop)
+{
+    int i, ret = 0;
+    pmix_info_t *info, *info2;
+    pmix_buffer_t *buffer = PMIX_NEW(pmix_buffer_t);
+    pmix_kval_t *kv = PMIX_NEW(pmix_kval_t), *kv2 = PMIX_NEW(pmix_kval_t);
+    pmix_data_array_t *darray;
+
+    PMIX_DATA_ARRAY_CREATE(darray, 10, PMIX_INFO);
+    info = (pmix_info_t*)darray->array;
+
+    for (i = 0; i < 10; i++) {
+        sprintf(info[i].key, "key-%d", i);
+        info[i].value.type = PMIX_PROC;
+        PMIX_PROC_CREATE(info[i].value.data.proc, 1);
+        info[i].value.data.proc->rank = i;
+        sprintf(info[i].value.data.proc->nspace, "nspace-%d", i);
+    }
+
+    kv->key = strdup("darray");
+    kv->value = (pmix_value_t*)malloc(sizeof(pmix_value_t));
+    kv->value->type = PMIX_DATA_ARRAY;
+    kv->value->data.darray = darray;
+
+    ret = bfrop->pack(buffer, kv, 1, PMIX_KVAL);
+    if (ret != PMIX_SUCCESS) {
+        fprintf(stderr, "%s:%d: pack PMIX_INFO ERR %d\n",
+                __FILE__, __LINE__, ret);
+        return ret;
+    }
+    uint32_t cnt = 1;
+    ret = bfrop->unpack(buffer, kv2, &cnt, PMIX_KVAL);
+    if (ret != PMIX_SUCCESS) {
+        fprintf(stderr, "%s:%d: unpack PMIX_INFO ERR %d\n",
+                __FILE__, __LINE__, ret);
+        return ret;
+    }
+
+
+    info2 = (pmix_info_t*)kv2->value->data.darray->array;
+    for (i = 0; i < 10; i++) {
+        if (!PMIX_CHECK_KEY(&info[i], info2[i].key)) {
+            fprintf(stderr, "%s:%d: unpack %s name mismatch: %s\n",
+                    __FILE__, __LINE__, info[i].key, info2[i].key);
+            return -1;
+        }
+        if (!PMIX_CHECK_PROCID(info[i].value.data.proc,
+                              info2[i].value.data.proc)) {
+            fprintf(stderr, "%s:%d: unpack proc %d name mismatch: %s:%d, expected %s:%d\n",
+                    __FILE__, __LINE__, i, info2[i].value.data.proc->nspace,
+                    info2[i].value.data.proc->rank,
+                    info[i].value.data.proc->nspace,
+                    info[i].value.data.proc->rank);
+            return -1;
+        }
+    }
+
+    PMIX_RELEASE(kv);
+    PMIX_RELEASE(kv2);
+    PMIX_RELEASE(buffer);
+
+    return ret;
+}
+
+static int test_darray_pack(pmix_bfrops_module_t *bfrop)
+{
+    int i, ret;
+    pmix_kval_t *kv = PMIX_NEW(pmix_kval_t), *kv2 = NULL;
+    pmix_data_type_t start_type = PMIX_SIZE;
+    pmix_data_array_t *darray;
+    pmix_buffer_t *buffer = PMIX_NEW(pmix_buffer_t);
+    size_t size = 12, size2;
+
+    PMIX_DATA_ARRAY_CREATE(darray, (int32_t)size, PMIX_INFO);
+    ret = bfrop->pack(buffer, &size, 1, PMIX_SIZE);
+    if (ret != PMIX_SUCCESS) {
+        fprintf(stderr, "%s:%d: pack PMIX_SIZE ERR %d\n",
+                __FILE__, __LINE__, ret);
+        return ret;
+    }
+    for (i = 0; i < 12; i ++) {
+        pmix_info_t *info = (pmix_info_t*)darray->array;
+        sprintf(info[i].key, "key-%d", i);
+        info[i].value.type = start_type + i;
+        info[i].value.data.int8 = (int8_t)i;
+    }
+
+    kv->key = strdup("darray");
+    kv->value = (pmix_value_t*)malloc(sizeof(pmix_value_t));
+    kv->value->type = PMIX_DATA_ARRAY;
+    kv->value->data.darray = darray;
+
+    ret = bfrop->pack(buffer, kv, 1, PMIX_KVAL);
+    if (ret != PMIX_SUCCESS) {
+        fprintf(stderr, "%s:%d: pack PMIX_KVAL ERR %d\n",
+                __FILE__, __LINE__, ret);
+        return ret;
+    }
+
+    /* unpacking */
+    int32_t cnt = 1;
+    ret = bfrop->unpack(buffer, &size2, &cnt, PMIX_SIZE);
+    if (ret != PMIX_SUCCESS) {
+        fprintf(stderr, "%s:%d: unpack PMIX_SIZE ERR %d\n",
+                __FILE__, __LINE__, ret);
+        return ret;
+    }
+
+    if (size != size2) {
+        fprintf(stderr, "%s:%d: unpacked size mismatch: %lu, expected %lu",
+                __FILE__, __LINE__, size2, size);
+        return -1;
+    }
+    cnt = 1;
+    kv2 = PMIX_NEW(pmix_kval_t);
+    ret = bfrop->unpack(buffer, kv2, &cnt, PMIX_KVAL);
+    if (ret != PMIX_SUCCESS) {
+        fprintf(stderr, "%s:%d: unpack PMIX_KVAL ERR %d\n",
+                __FILE__, __LINE__, ret);
+        return ret;
+    }
+    if ((kv2->value->type != PMIX_DATA_ARRAY) ||
+            (0 != strcmp(kv2->key, "darray"))) {
+        fprintf(stderr, "%s:%d: unpack type PMIX_DATA_ARRAY ERR\n",
+                __FILE__, __LINE__);
+        return -1;
+    }
+    for (i = 0; i < size2; i++) {
+        pmix_info_t *info2 = (pmix_info_t*)kv2->value->data.darray->array;
+        pmix_info_t *info = (pmix_info_t*)kv->value->data.darray->array;
+        if (0 != strcmp(info[i].key, info[i].key)) {
+            fprintf(stderr, "%s:%d: unpack key-%d name mismatch\n",
+                    __FILE__, __LINE__, i);
+            return -1;
+        }
+        if (info[i].value.data.int8 != (int8_t)i) {
+            fprintf(stderr, "%s:%d: unpack key val mismatch\n",
+                    __FILE__, __LINE__);
+            return -1;
+        }
+    }
+    PMIX_RELEASE(kv);
+    PMIX_RELEASE(kv2);
+    PMIX_RELEASE(buffer);
+
+    return 0;
+}
 
 int main(int argc, char **argv)
 {
@@ -162,13 +373,8 @@ int main(int argc, char **argv)
     int32_t cnt;
     int ret;
     int i;
-    integer_pack_test_fn test_fn_array[] = { integer_pack_test_int64_t_fn,
-                                             integer_pack_test_uint64_t_fn,
-                                             integer_pack_test_int32_t_fn,
-                                             integer_pack_test_uint32_t_fn,
-                                             integer_pack_test_int16_t_fn,
-                                             integer_pack_test_uint16_t_fn,
-                                             NULL };
+    pmix_status_t status = 1;
+    pmix_status_t status_unpack = 0;
 
     if (PMIX_SUCCESS != (ret = init(&bfrop))) {
         fprintf(stderr, "init error %d\n", ret);
@@ -177,24 +383,26 @@ int main(int argc, char **argv)
 
     fprintf(stderr, "Bfrops version: %s\n", bfrop->version);
 
-
-    printf("%ld\n", src);
-    ret = bfrop->pack(buffer, &src, 1, PMIX_INT64);
+    ret = bfrop->pack(buffer, &status, 1, PMIX_STATUS);
     fprintf(stderr, "pack ret %d\n", ret);
 
     fprintf(stderr, "allocated %lu, used %lu\n", buffer->bytes_allocated, buffer->bytes_used);
 
     cnt = 1;
-    ret = bfrop->unpack(buffer, &dst, &cnt, PMIX_INT64);
-    fprintf(stderr, "unpack ret %d, value %ld\n", ret, (int64_t)dst);
+    ret = bfrop->unpack(buffer, &status_unpack, &cnt, PMIX_STATUS);
+    fprintf(stderr, "unpack ret %d, value %d\n", ret, status_unpack);
 
-    for (i = 0; test_fn_array[i] != NULL; i++) {
-        ret = test_fn_array[i](bfrop);
-        if (ret != PMIX_SUCCESS) {
-            fprintf(stderr, "Test ERROR\n");
-            return ret;
-        }
-    }
+    ret = test_int_pack(bfrop);
+    fprintf(stderr, "integer 16/32/64 packing test: %s\n", !ret ? "OK" : "Error");
+
+    ret = test_darray_pack(bfrop);
+    fprintf(stderr, "darray key-val packing test: %s\n", !ret ? "OK" : "Error");
+
+    ret = test_proc_pack(bfrop);
+    fprintf(stderr, "proc packing test: %s\n", !ret ? "OK" : "Error");
+
+    ret = test_pinfo_pack(bfrop);
+    fprintf(stderr, "proc_info packing test: %s\n", !ret ? "OK" : "Error");
 
     return 0;
 }
